@@ -1,21 +1,34 @@
 #include <Wire.h>
 
-
+const int mpuRegister = 0x68;
+const int mpuResetRegister = 0x6B;
+const int mpuGyroConfigRegister = 0x1B;
+const int mpuAccConfigRegister = 0x1C;
+const int mpuGyroRegister = 0x43;
+const int mpuAccRegister = 0x3B;
 const int hmcRegister = 0x1E;
 const int hmcModeRegister = 0x02;
 const int hmcMagRegister = 0x03;
+const float factor = 0.00010687022;
 
 float xOff, yOff, zOff;
 float xCal, yCal, zCal;
 float hmcX, hmcY, hmcZ;
+float xComp, yComp;
 float heading;
 
-float temp;
+long accX, accY, accZ;
+long accVector;
+int gyroX, gyroY, gyroZ;
+float gyroXOffset, gyroYOffset, gyroZOffset;
+float pitch, roll;
+float accPitch, accRoll;
+bool isGyroCalibrated = false;
+bool isStart = true;
+float filteredPitch, filteredRoll;
 
-float xComp, yComp;
-
-float pi = 3.14159265358979323;
-
+unsigned long loopTimer;
+const float pi = 3.14159265358979323;
 
 
 void readHmc(){
@@ -29,38 +42,135 @@ void readHmc(){
 }
 
 
-void setup() {
+void readGyro(){
+  Wire.beginTransmission(mpuRegister);
+  Wire.write(mpuGyroRegister);
+  Wire.endTransmission(false);
+  Wire.requestFrom(mpuRegister, 6, true);
+  if (!isGyroCalibrated){
+    gyroX = (Wire.read() << 8|Wire.read());
+    gyroY = (Wire.read() << 8|Wire.read());
+    gyroZ = (Wire.read() << 8|Wire.read());
+  }
+  else{
+    gyroX = (Wire.read() << 8|Wire.read()) - gyroXOffset;
+    gyroY = (Wire.read() << 8|Wire.read()) - gyroYOffset;
+    gyroZ = (Wire.read() << 8|Wire.read()) - gyroZOffset;    
+  }
+}
+
+
+void readAcc(){
+  Wire.beginTransmission(mpuRegister);
+  Wire.write(mpuAccRegister);
+  Wire.endTransmission(false);
+  Wire.requestFrom(mpuRegister, 6, true);
+  accX = (Wire.read() << 8|Wire.read());
+  accY = (Wire.read() << 8|Wire.read());
+  accZ = (Wire.read() << 8|Wire.read());
+}
+
+
+void calibrateGyro(){
+  long int start = millis();
+  int count = 0;
+  while(millis() < start+5000){
+    readGyro();
+    gyroXOffset += gyroX;
+    gyroYOffset += gyroY;
+    gyroZOffset += gyroZ;
+    count += 1;
+  }
+  gyroXOffset /= count;
+  gyroYOffset /= count;
+  gyroZOffset /= count;
+  isGyroCalibrated = true;
+}
+
+
+void setup(){
   Serial.begin(115200);
   Wire.begin();
+  Wire.beginTransmission(mpuRegister);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  Wire.endTransmission(true);
+
+  Wire.beginTransmission(mpuRegister);
+  Wire.write(mpuGyroConfigRegister);
+  Wire.write(0x08);
+  Wire.endTransmission(true);
+
+  Wire.beginTransmission(mpuRegister);
+  Wire.write(mpuAccConfigRegister);
+  Wire.write(0x10);
+  Wire.endTransmission(true);
+
   Wire.beginTransmission(hmcRegister);
   Wire.write(hmcModeRegister);
   Wire.write(0x00);
   Wire.endTransmission(true);
+
+  calibrateGyro();
+  loopTimer = micros();
 }
 
-void loop() {
+void loop(){
+  readGyro();
+
+  pitch += gyroX * factor;
+  roll += gyroY * factor;
+
+  pitch += roll * sin(gyroZ * 0.00000932618);
+  roll -= pitch * sin(gyroZ * 0.00000932618);
+
+  readAcc();
+
+  accVector = sqrt((accX*accX)+(accY*accY)+(accZ*accZ));
+  accPitch = asin((float)accY/accVector)* 57.296;
+  accRoll = asin((float)accX/accVector)* -57.296;
+
+  accPitch += 1.25;
+  accRoll += 6.4;
+
+  if(isStart){
+    pitch = accPitch;
+    roll = accRoll;
+    isStart = false;
+  }
+  else{
+    pitch = pitch * 0.9996 + accPitch *0.0004;
+    roll = roll * 0.9996 + accRoll *0.0004;
+  }
+
+  filteredPitch = filteredPitch * 0.9 + pitch * 0.1;
+  filteredRoll = filteredRoll * 0.9 + roll * 0.1;
+
   readHmc();
-  
   hmcX /= 10.90;
-  hmcZ /= 10.90;
   hmcY /= 10.90;
+  hmcZ /= 10.90;
   xOff = hmcX - 3.800202;
-  yOff = hmcY + 6.923689;
-  zOff = hmcZ + 7.969065;
+  zOff = hmcY + 6.923689;
+  yOff = hmcZ + 7.969065;
 
   xCal =  1.013272*xOff + 0.028993*yOff + 0.005559*zOff;
   zCal =  0.028993*xOff + 1.038330*yOff + 0.002060*zOff;
   yCal =  0.005559*xOff + 0.002060*yOff + 1.025920*zOff;
+
+
+  xComp = xCal * cos(pitch * 0.0174533) + yCal * sin(roll * -0.0174533) * sin(pitch * 0.0174533) - zCal * cos(roll * -0.0174533) * sin(pitch * 0.0174533);
+  yComp = yCal * cos(roll * -0.0174533) + zCal * sin(roll * -0.0174533);
+
+  if (yComp < 0) heading = 180 + (180 + ((atan2(yComp, xComp)) * (180 / pi)));
+  else heading = (atan2(yComp, xComp)) * (180 / pi);
+
+  heading += 16.41667;
+  if (heading < 0) heading += 360;
+  else if (heading >= 360) heading -= 360;
   
+  Serial.println(heading);
 
-  //Serial.print(xCal); Serial.print(","); Serial.print(yCal); Serial.print(","); Serial.println(zCal);
-
-  heading = (atan2(hmcY, hmcX)*(180/pi));
-  heading = 360 + heading + 16.41667;
-  if (heading > 360){
-    heading -= 360;
-  }
-
-  Serial.print(hmcX); Serial.print(", "); Serial.print(hmcY); Serial.print(", "); Serial.print(hmcZ); Serial.print(", "); Serial.println(heading);
-  delay(100);
+  while(micros() - loopTimer < 7000);
+  loopTimer = micros();
 }
